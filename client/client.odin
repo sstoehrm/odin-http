@@ -81,16 +81,24 @@ Error :: union #shared_nil {
 	SSL_Error,
 }
 
-request :: proc(request: ^Request, target: string, allocator := context.allocator) -> (res: Response, err: Error) {
-	url, endpoint := parse_endpoint(target) or_return
+dial :: proc(target: string) -> (socket: net.TCP_Socket, url: http.URL, err: Error) {
+	endpoint: net.Endpoint
+	url, endpoint = parse_endpoint(target) or_return
+	socket = net.dial_tcp(endpoint) or_return
+	return
+}
 
+request_on :: proc(
+	request: ^Request,
+	socket: net.TCP_Socket,
+	url: http.URL,
+	allocator := context.allocator,
+) -> (res: Response, err: Error) {
 	// NOTE: we don't support persistent connections yet.
 	http.headers_set_close(&request.headers)
 
 	req_buf := format_request(url, request, allocator)
 	defer bytes.buffer_destroy(&req_buf)
-
-	socket := net.dial_tcp(endpoint) or_return
 
 	// HTTPS using openssl.
 	if url.scheme == "https" {
@@ -131,6 +139,15 @@ request :: proc(request: ^Request, target: string, allocator := context.allocato
 	// HTTP, just send the request.
 	net.send_tcp(socket, bytes.buffer_to_bytes(&req_buf)) or_return
 	return parse_response(socket, allocator)
+}
+
+request :: proc(request: ^Request, target: string, allocator := context.allocator) -> (res: Response, err: Error) {
+	socket, url := dial(target) or_return
+	res, err = request_on(request, socket, url, allocator)
+	if err != nil {
+		net.close(socket)
+	}
+	return
 }
 
 Response :: struct {

@@ -81,16 +81,24 @@ Error :: union #shared_nil {
 	SSL_Error,
 }
 
-request :: proc(request: ^Request, target: string, allocator := context.allocator) -> (res: Response, err: Error) {
-	url, endpoint := parse_endpoint(target) or_return
+dial :: proc(target: string) -> (socket: net.TCP_Socket, url: http.URL, err: Error) {
+	endpoint: net.Endpoint
+	url, endpoint = parse_endpoint(target) or_return
+	socket = net.dial_tcp(endpoint) or_return
+	return
+}
 
+request_on :: proc(
+	request: ^Request,
+	socket: net.TCP_Socket,
+	url: http.URL,
+	allocator := context.allocator,
+) -> (res: Response, err: Error) {
 	// NOTE: we don't support persistent connections yet.
 	http.headers_set_close(&request.headers)
 
 	req_buf := format_request(url, request, allocator)
 	defer bytes.buffer_destroy(&req_buf)
-
-	socket := net.dial_tcp(endpoint) or_return
 
 	// HTTPS using openssl.
 	if url.scheme == "https" {
@@ -131,6 +139,15 @@ request :: proc(request: ^Request, target: string, allocator := context.allocato
 	// HTTP, just send the request.
 	net.send_tcp(socket, bytes.buffer_to_bytes(&req_buf)) or_return
 	return parse_response(socket, allocator)
+}
+
+request :: proc(request: ^Request, target: string, allocator := context.allocator) -> (res: Response, err: Error) {
+	socket, url := dial(target) or_return
+	res, err = request_on(request, socket, url, allocator)
+	if err != nil {
+		net.close(socket)
+	}
+	return
 }
 
 Response :: struct {
@@ -330,7 +347,10 @@ _response_till_close :: proc(_body: ^bufio.Scanner, max_length: int) -> (string,
 // Meant for internal usage, you should use `client.response_body`.
 _response_body_length :: proc(_body: ^bufio.Scanner, max_length: int, len: string) -> (string, Body_Error) {
 	ilen, lenok := strconv.parse_int(len, 10)
-	if !lenok {
+	// parse_int accepts a leading '-'; a negative length later reaches
+	// scan_num_bytes as `data[:ilen]` (a negative-index slice) and aborts
+	// the process on the bounds check. Reject it here. (redin #163)
+	if !lenok || ilen < 0 {
 		return "", .Invalid_Length
 	}
 
@@ -411,7 +431,10 @@ _response_body_chunked :: proc(
 		}
 
 		size, ok := strconv.parse_int(string(size_line), 16)
-		if !ok {
+		// A negative chunk size (parse_int accepts '-') would reach
+		// scan_num_bytes as a negative-index slice and abort the process.
+		// (redin #163)
+		if !ok || size < 0 {
 			err = .Invalid_Chunk_Size
 			return
 		}

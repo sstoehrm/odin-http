@@ -199,7 +199,9 @@ _body_chunked :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb
 		}
 
 		size, ok := strconv.parse_int(string(size_line), 16)
-		if !ok {
+		// Reject negative sizes too (parse_int accepts '-'); a negative
+		// chunk size would otherwise reach a negative-index slice. (redin #163)
+		if !ok || size < 0 {
 			log.infof("Encountered an invalid chunk size when decoding a chunked body: %q", string(size_line))
 			s.cb(s.user_data, "", .Bad_Read_Count)
 			return

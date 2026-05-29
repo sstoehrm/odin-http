@@ -150,6 +150,13 @@ parse_response :: proc(socket: Communication, allocator := context.allocator) ->
 
 	rline_str := bufio.scanner_text(&scanner)
 	si := strings.index_byte(rline_str, ' ')
+	// A status line with no space yields si == -1, and rline_str[:si] is a
+	// negative-index slice that aborts the process on the bounds check
+	// before version_parse can reject it. (redin #163)
+	if si < 0 {
+		err = Request_Error.Invalid_Response_HTTP_Version
+		return
+	}
 
 	version, ok := http.version_parse(rline_str[:si])
 	if !ok {

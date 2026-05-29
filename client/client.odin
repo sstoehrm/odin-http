@@ -347,7 +347,10 @@ _response_till_close :: proc(_body: ^bufio.Scanner, max_length: int) -> (string,
 // Meant for internal usage, you should use `client.response_body`.
 _response_body_length :: proc(_body: ^bufio.Scanner, max_length: int, len: string) -> (string, Body_Error) {
 	ilen, lenok := strconv.parse_int(len, 10)
-	if !lenok {
+	// parse_int accepts a leading '-'; a negative length later reaches
+	// scan_num_bytes as `data[:ilen]` (a negative-index slice) and aborts
+	// the process on the bounds check. Reject it here. (redin #163)
+	if !lenok || ilen < 0 {
 		return "", .Invalid_Length
 	}
 
@@ -428,7 +431,10 @@ _response_body_chunked :: proc(
 		}
 
 		size, ok := strconv.parse_int(string(size_line), 16)
-		if !ok {
+		// A negative chunk size (parse_int accepts '-') would reach
+		// scan_num_bytes as a negative-index slice and abort the process.
+		// (redin #163)
+		if !ok || size < 0 {
 			err = .Invalid_Chunk_Size
 			return
 		}

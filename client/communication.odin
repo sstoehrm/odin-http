@@ -143,6 +143,23 @@ parse_response :: proc(socket: Communication, allocator := context.allocator) ->
 
 	http.headers_init(&res.headers, allocator)
 
+	// On any error return below, free the partially-built response (the
+	// headers map + cloned keys/values and any parsed cookies). Previously
+	// only the scanner was destroyed, leaking the headers on a malformed
+	// response; response_destroy is the only other place that frees these
+	// and callers don't run it on an errored response. (redin #177)
+	defer if err != nil {
+		for k, v in res.headers._kv {
+			delete(v, res.headers._kv.allocator)
+			delete(k, res.headers._kv.allocator)
+		}
+		delete(res.headers._kv)
+		for cookie in res.cookies {
+			delete(cookie._raw)
+		}
+		delete(res.cookies)
+	}
+
 	if !bufio.scanner_scan(&scanner) {
 		err = bufio.scanner_error(&scanner)
 		return

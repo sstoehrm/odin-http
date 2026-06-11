@@ -104,6 +104,17 @@ request_on :: proc(
 	if url.scheme == "https" {
 		ctx := openssl.SSL_CTX_new(openssl.TLS_client_method())
 		ssl := openssl.SSL_new(ctx)
+		// On any error return from this HTTPS branch (handshake, write, or
+		// parse_response), free the OpenSSL objects — previously leaked.
+		// On success err==nil so this is skipped and ownership lives in
+		// res._socket (freed by response_destroy). Callers don't
+		// response_destroy an errored response (they net.close the socket),
+		// so there is no double-free. SSL_free/SSL_CTX_free are NULL-safe.
+		// (redin #176)
+		defer if err != nil {
+			openssl.SSL_free(ssl)
+			openssl.SSL_CTX_free(ctx)
+		}
 		openssl.SSL_set_fd(ssl, c.int(socket))
 
 		// For servers using SNI for SSL certs (like cloudflare), this needs to be set.

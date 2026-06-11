@@ -69,6 +69,43 @@ SSL_Error :: enum {
 	Controlled_Shutdown,
 	Fatal_Shutdown,
 	SSL_Write_Failed,
+	// The default trust store could not be loaded.
+	Trust_Store_Unavailable,
+	// The server certificate failed verification (untrusted chain,
+	// expired, or hostname/IP mismatch).
+	Certificate_Verification_Failed,
+}
+
+// Bare hostname for SNI and certificate verification: strips an optional
+// userinfo@ prefix, IPv6 brackets, and a trailing :port from a URL host
+// component ("name:8443" → "name", "[::1]:8443" → "::1", "u@h" → "h").
+// An unbracketed IPv6 address (multiple colons) is returned whole.
+tls_hostname :: proc(host: string) -> string {
+	h := host
+	if at := strings.last_index_byte(h, '@'); at >= 0 {
+		h = h[at + 1:]
+	}
+	if len(h) > 0 && h[0] == '[' {
+		if close := strings.index_byte(h, ']'); close > 0 {
+			return h[1:close]
+		}
+		return h
+	}
+	colon := strings.last_index_byte(h, ':')
+	if colon >= 0 && strings.index_byte(h, ':') == colon {
+		port := h[colon + 1:]
+		is_port := len(port) > 0
+		for ch in port {
+			if ch < '0' || ch > '9' {
+				is_port = false
+				break
+			}
+		}
+		if is_port {
+			return h[:colon]
+		}
+	}
+	return h
 }
 
 Error :: union #shared_nil {
@@ -103,23 +140,57 @@ request_on :: proc(
 	// HTTPS using openssl.
 	if url.scheme == "https" {
 		ctx := openssl.SSL_CTX_new(openssl.TLS_client_method())
-		ssl := openssl.SSL_new(ctx)
-		// On any error return from this HTTPS branch (handshake, write, or
-		// parse_response), free the OpenSSL objects — previously leaked.
-		// On success err==nil so this is skipped and ownership lives in
-		// res._socket (freed by response_destroy). Callers don't
+		ssl: ^openssl.SSL
+		// On any error return from this HTTPS branch (setup, handshake,
+		// write, or parse_response), free the OpenSSL objects — previously
+		// leaked. On success err==nil so this is skipped and ownership
+		// lives in res._socket (freed by response_destroy). Callers don't
 		// response_destroy an errored response (they net.close the socket),
-		// so there is no double-free. SSL_free/SSL_CTX_free are NULL-safe.
+		// so there is no double-free. SSL_free/SSL_CTX_free are NULL-safe,
+		// which also covers error returns before SSL_new below.
 		// (redin #176)
 		defer if err != nil {
 			openssl.SSL_free(ssl)
 			openssl.SSL_CTX_free(ctx)
 		}
+
+		// Verify the server certificate chain against the default trust
+		// store (SSL_CERT_FILE / SSL_CERT_DIR are honoured) and pin the
+		// expected hostname/IP, so a self-signed or wrong-host certificate
+		// fails the handshake. SSL_CTX_new defaults to SSL_VERIFY_NONE,
+		// which accepts ANY certificate. (redin TLS verification)
+		openssl.SSL_CTX_set_verify(ctx, openssl.SSL_VERIFY_PEER, nil)
+		if openssl.SSL_CTX_set_default_verify_paths(ctx) != 1 {
+			err = SSL_Error.Trust_Store_Unavailable
+			return
+		}
+
+		ssl = openssl.SSL_new(ctx)
 		openssl.SSL_set_fd(ssl, c.int(socket))
 
-		// For servers using SNI for SSL certs (like cloudflare), this needs to be set.
-		chostname := strings.clone_to_cstring(url.host, allocator)
+		// url.host may carry a :port (url_parse does not split it) and,
+		// pathologically, a userinfo@ prefix; both SNI and certificate
+		// name verification need the bare hostname.
+		hostname := tls_hostname(url.host)
+		chostname := strings.clone_to_cstring(hostname, allocator)
 		defer delete(chostname, allocator)
+
+		// IP literals are matched against IP SANs, names against DNS SANs.
+		param := openssl.SSL_get0_param(ssl)
+		host_pinned: c.int
+		if net.parse_address(hostname) != nil {
+			host_pinned = openssl.X509_VERIFY_PARAM_set1_ip_asc(param, chostname)
+		} else {
+			host_pinned = openssl.X509_VERIFY_PARAM_set1_host(param, chostname, 0)
+		}
+		if host_pinned != 1 {
+			// Fail closed: a handshake without a pinned name would accept
+			// any valid-for-some-host certificate.
+			err = SSL_Error.Certificate_Verification_Failed
+			return
+		}
+
+		// For servers using SNI for SSL certs (like cloudflare), this needs to be set.
 		openssl.SSL_set_tlsext_host_name(ssl, chostname)
 
 		switch openssl.SSL_connect(ssl) {
@@ -128,7 +199,13 @@ request_on :: proc(
 			return
 		case 1: // success
 		case:
-			err = SSL_Error.Fatal_Shutdown
+			// Distinguish certificate rejection from transport failures;
+			// the verify result is recorded even when the handshake aborts.
+			if openssl.SSL_get_verify_result(ssl) != openssl.X509_V_OK {
+				err = SSL_Error.Certificate_Verification_Failed
+			} else {
+				err = SSL_Error.Fatal_Shutdown
+			}
 			return
 		}
 

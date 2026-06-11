@@ -53,10 +53,16 @@ version_check :: proc "contextless" () {
 SSL_METHOD :: struct {}
 SSL_CTX :: struct {}
 SSL :: struct {}
+X509_VERIFY_PARAM :: struct {}
 
 SSL_CTRL_SET_TLSEXT_HOSTNAME :: 55
 
 TLSEXT_NAMETYPE_host_name :: 0
+
+SSL_VERIFY_NONE :: 0
+SSL_VERIFY_PEER :: 1
+
+X509_V_OK :: 0
 
 foreign lib {
 	TLS_client_method :: proc() -> ^SSL_METHOD ---
@@ -72,6 +78,15 @@ foreign lib {
 	ERR_print_errors_fp :: proc(fp: ^libc.FILE) ---
 	SSL_ctrl :: proc(ssl: ^SSL, cmd: c.int, larg: c.long, parg: rawptr) -> c.long ---
     OpenSSL_version_num :: proc() -> c.ulong ---
+
+	// Certificate verification (libssl + libcrypto).
+	SSL_CTX_set_verify :: proc(ctx: ^SSL_CTX, mode: c.int, callback: rawptr) ---
+	SSL_CTX_set_default_verify_paths :: proc(ctx: ^SSL_CTX) -> c.int ---
+	SSL_get0_param :: proc(ssl: ^SSL) -> ^X509_VERIFY_PARAM ---
+	SSL_get_verify_result :: proc(ssl: ^SSL) -> c.long ---
+	X509_VERIFY_PARAM_set1_host :: proc(param: ^X509_VERIFY_PARAM, name: cstring, namelen: c.size_t) -> c.int ---
+	X509_VERIFY_PARAM_set1_ip_asc :: proc(param: ^X509_VERIFY_PARAM, ipasc: cstring) -> c.int ---
+	X509_verify_cert_error_string :: proc(n: c.long) -> cstring ---
 }
 
 // This is a macro in c land.
